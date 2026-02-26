@@ -645,7 +645,17 @@ static void ci_compute_single_dpu_payload(size_t ci, uint8_t dpu_local,
 
   auto &ci_state = state.runtime->cis[ci];
   const uint8_t original_mask = ci_state.selected_mask;
-  ci_state.selected_mask = static_cast<uint8_t>(1u << dpu_local);
+  const uint8_t worker_mask =
+      static_cast<uint8_t>(original_mask & static_cast<uint8_t>(1u << dpu_local));
+
+  if (worker_mask == 0u) {
+    if (selected_mask_out) {
+      *selected_mask_out = original_mask;
+    }
+    return;
+  }
+
+  ci_state.selected_mask = worker_mask;
 
   bool worker_needs_mask_fuzz = false;
   const uint32_t payload_part = upmem_runtime_payload_for_command(

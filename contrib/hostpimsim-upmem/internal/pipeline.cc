@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
@@ -35,19 +36,17 @@ static_assert(WRAM_OFFSET + WRAM_SIZE <= PRIVATE_MEM_SIZE,
               "WRAM region must fit private memory");
 
 static inline size_t get_max_exec_steps() {
-  static bool initialized = false;
-  static size_t value = kDefaultMaxExecSteps;
-
-  if (!initialized) {
+  static const size_t value = [] {
+    size_t parsed_value = kDefaultMaxExecSteps;
     if (const char *env = std::getenv("HOSTPIMSIM_UPMEM_MAX_EXEC_STEPS")) {
       char *end = nullptr;
       const unsigned long long parsed = std::strtoull(env, &end, 10);
       if (end != env && *end == '\0' && parsed > 0ull) {
-        value = static_cast<size_t>(parsed);
+        parsed_value = static_cast<size_t>(parsed);
       }
     }
-    initialized = true;
-  }
+    return parsed_value;
+  }();
 
   return value;
 }
@@ -581,7 +580,8 @@ enum class ThreadCmdKind : uint8_t {
 
 struct DecodedInst48;
 struct DecodedProgram48CacheEntry;
-const DecodedProgram48CacheEntry *get_decoded_program_cache_48(DpuState &dpu);
+std::shared_ptr<const DecodedProgram48CacheEntry>
+get_decoded_program_cache_48(DpuState &dpu);
 void invalidate_decoded_program_cache_48(const DpuState *dpu);
 
 bool replay_strict_sig_allowed_48(const std::string &sig);
@@ -662,8 +662,8 @@ static inline uint64_t ci_wram_write_word_structure_for_addr(uint32_t address) {
 
 static inline bool decode_wram_write_word_structure(uint64_t cmd,
                                                     uint16_t &address) {
-  static uint64_t cached_cmd = UINT64_MAX;
-  static uint16_t cached_addr = 0;
+  static thread_local uint64_t cached_cmd = UINT64_MAX;
+  static thread_local uint16_t cached_addr = 0;
 
   if (cmd == cached_cmd) {
     address = cached_addr;
@@ -694,8 +694,8 @@ ci_wram_write_word_frame_upper_for_addr(uint32_t address) {
 
 static inline bool decode_wram_write_word_frame_low5(uint64_t cmd,
                                                      uint8_t &low5) {
-  static uint64_t cached_key = UINT64_MAX;
-  static uint8_t cached_low5 = 0;
+  static thread_local uint64_t cached_key = UINT64_MAX;
+  static thread_local uint8_t cached_low5 = 0;
 
   const uint64_t key = cmd & 0xFFFFFFFF00000000ULL;
   if (key == cached_key) {
@@ -717,8 +717,8 @@ static inline bool decode_wram_write_word_frame_low5(uint64_t cmd,
 
 static inline bool decode_wram_read_word_frame(uint64_t cmd,
                                                uint32_t &address) {
-  static uint64_t cached_cmd = UINT64_MAX;
-  static uint32_t cached_addr = 0;
+  static thread_local uint64_t cached_cmd = UINT64_MAX;
+  static thread_local uint32_t cached_addr = 0;
 
   if (cmd == cached_cmd) {
     address = cached_addr;
@@ -15479,16 +15479,25 @@ static inline bool decode_raw_word_48(uint64_t instruction, RawDecoded48 &out) {
 
 /* ---- merged from decode.cc ---- */
 
-static std::unordered_map<const DpuState *, DecodedProgram48CacheEntry> &
+static std::unordered_map<const DpuState *,
+                          std::shared_ptr<const DecodedProgram48CacheEntry>> &
 program_cache_48() {
-  static std::unordered_map<const DpuState *, DecodedProgram48CacheEntry> cache;
+  static std::unordered_map<const DpuState *,
+                            std::shared_ptr<const DecodedProgram48CacheEntry>>
+      cache;
   return cache;
+}
+
+static std::mutex &program_cache_48_mutex() {
+  static std::mutex cache_mutex;
+  return cache_mutex;
 }
 
 void invalidate_decoded_program_cache_48(const DpuState *dpu) {
   if (!dpu) {
     return;
   }
+  std::lock_guard<std::mutex> lock(program_cache_48_mutex());
   program_cache_48().erase(dpu);
 }
 
@@ -15512,12 +15521,9 @@ static inline const char *decode_cache_dir_48() {
 }
 
 static inline void ensure_decode_cache_dir_48() {
-  static bool initialized = false;
-  if (initialized) {
-    return;
-  }
-  (void)::mkdir(decode_cache_dir_48(), 0755);
-  initialized = true;
+  static std::once_flag initialized;
+  std::call_once(initialized,
+                 [] { (void)::mkdir(decode_cache_dir_48(), 0755); });
 }
 
 static inline std::string decode_cache_path_48(uint64_t key) {
@@ -16021,11 +16027,15 @@ static inline bool decode_iram_program_48(const uint8_t *iram_bytes,
 
   const uint64_t key = hash_iram_words(words_out);
   static std::unordered_map<uint64_t, std::vector<DecodedInst48>> cache;
+  static std::mutex cache_mutex;
 
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    decoded = it->second;
-    return true;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+      decoded = it->second;
+      return true;
+    }
   }
 
   ensure_decode_cache_dir_48();
@@ -16051,7 +16061,10 @@ static inline bool decode_iram_program_48(const uint8_t *iram_bytes,
 
       if (ok_file) {
         decoded = std::move(out);
-        cache.emplace(key, decoded);
+        {
+          std::lock_guard<std::mutex> lock(cache_mutex);
+          cache.emplace(key, decoded);
+        }
         return true;
       }
     }
@@ -16074,27 +16087,39 @@ static inline bool decode_iram_program_48(const uint8_t *iram_bytes,
   }
 
   decoded = std::move(out);
-  cache.emplace(key, decoded);
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    cache.emplace(key, decoded);
+  }
   return true;
 }
 
-const DecodedProgram48CacheEntry *get_decoded_program_cache_48(DpuState &dpu) {
-  auto &cache = program_cache_48();
-  const auto it = cache.find(&dpu);
-  if (it != cache.end()) {
-    return &it->second;
+std::shared_ptr<const DecodedProgram48CacheEntry>
+get_decoded_program_cache_48(DpuState &dpu) {
+  {
+    std::lock_guard<std::mutex> lock(program_cache_48_mutex());
+    auto &cache = program_cache_48();
+    const auto it = cache.find(&dpu);
+    if (it != cache.end()) {
+      return it->second;
+    }
   }
 
-  DecodedProgram48CacheEntry entry;
+  auto entry = std::make_shared<DecodedProgram48CacheEntry>();
   std::vector<uint64_t> words;
   if (!decode_iram_program_48(dpu.private_mem.data() + IRAM_OFFSET,
-                              entry.decoded, words)) {
+                              entry->decoded, words)) {
     return nullptr;
   }
 
-  auto [inserted, ok] = cache.emplace(&dpu, std::move(entry));
-  (void)ok;
-  return &inserted->second;
+  std::lock_guard<std::mutex> lock(program_cache_48_mutex());
+  auto &cache = program_cache_48();
+  const auto it = cache.find(&dpu);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  cache.emplace(&dpu, entry);
+  return entry;
 }
 
 /* ---- merged from execute.cc ---- */
@@ -16731,7 +16756,7 @@ bool execute_launch_program_48(DpuState &dpu) {
   const auto launch_t0 =
       launch_timing ? launch_clock::now() : launch_clock::time_point{};
 
-  const DecodedProgram48CacheEntry *decoded_cache =
+  const std::shared_ptr<const DecodedProgram48CacheEntry> decoded_cache =
       get_decoded_program_cache_48(dpu);
   if (!decoded_cache) {
     return false;
