@@ -1,5 +1,5 @@
-#include "internal.hh"
-#include "runtime.hh"
+#include "ci.hh"
+#include "../dpu/runtime.hh"
 
 CI::CI() = default;
 

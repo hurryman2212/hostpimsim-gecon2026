@@ -1,4 +1,4 @@
-#include "internal.hh"
+#include "dpu.hh"
 #include "runtime.hh"
 
 MRAM::MRAM(void *mapping_base, size_t mapping_size)

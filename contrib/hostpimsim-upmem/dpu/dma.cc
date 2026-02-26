@@ -1,4 +1,4 @@
-#include "internal.hh"
+#include "dpu.hh"
 #include "runtime.hh"
 
 #include <algorithm>
