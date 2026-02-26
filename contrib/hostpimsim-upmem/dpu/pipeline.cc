@@ -1,4 +1,5 @@
-#include "internal.hh"
+#include "dpu.hh"
+#include "../ci/ci.hh"
 #include "runtime.hh"
 
 /* Merged runtime/decode/execute/control/ci pipeline translation unit. */
@@ -592,7 +593,7 @@ void replay_update_sources_48(const DecodedInst48 &ins, dpu_regfile &rf);
 bool execute_launch_program_48(DpuState &dpu);
 void execute_launch_program(DpuState &dpu);
 
-/* dpu_index is declared in internal.hh */
+/* dpu_index is declared in dpu/runtime.hh */
 
 static inline uint64_t encode_frame_from_x(uint64_t x, uint8_t tag) {
   uint64_t cmd = 0x3300000000000000ULL;

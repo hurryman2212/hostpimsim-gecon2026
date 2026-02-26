@@ -1,6 +1,7 @@
 #pragma once
 
-#include "internal/internal.hh"
+#include "ci/ci.hh"
+#include "dpu/dpu.hh"
 
 #include <array>
 #include <condition_variable>

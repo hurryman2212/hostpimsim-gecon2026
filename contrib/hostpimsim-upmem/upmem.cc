@@ -1,6 +1,6 @@
 #include "upmem.hh"
 #include "hostpimsim.h"
-#include "internal/runtime.hh"
+#include "dpu/runtime.hh"
 
 #include <cstdarg>
 #include <cstring>
