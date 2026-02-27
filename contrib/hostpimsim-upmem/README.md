@@ -61,6 +61,10 @@ Output:
   - Prints instruction-signature frequency profile for launch48.
 - `HOSTPIMSIM_UPMEM_PROFILE_SIG_LIMIT=<N>`
   - Limits printed Top-N entries for signature profile (`default: 24`).
+- `HOSTPIMSIM_UPMEM_EAGER_ZERO_ALLOC=1`
+  - Restores eager zero-fill on MRAM/DAX allocation paths.
+  - Use as an immediate rollback/workaround toggle when cold-start kernels
+    show first-touch regressions (for example, `TRNS@64`, `TS@1`).
 - `HOSTPIMSIM_UPMEM_LAUNCH_TIMING=1`
   - Prints launch48 decode/execute timing breakdown (`decode_us`, `exec_us`, `total_us`).
 - `HOSTPIMSIM_UPMEM_REPLAY_MODEL=1|2`
@@ -85,3 +89,8 @@ Output:
 - Decoded 48-bit IRAM programs are cached in-process and also persisted to:
   - `/tmp/hostpimsim-upmem-decode-cache/<hash>.txt`
 - This significantly reduces repeated decode overhead on subsequent runs of the same DPU binary.
+
+## Review Supplement
+
+- Round 1 보완 문서:
+  - `docs/hostpimsim-upmem-review-round1-supplement-2026-02-27.md`
