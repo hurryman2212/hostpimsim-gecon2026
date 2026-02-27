@@ -1,6 +1,7 @@
 #pragma once
 
 #include "hostpimsim.h"
+#include "../dpu/dpu.hh"
 
 #include <array>
 #include <atomic>
@@ -8,7 +9,7 @@
 #include <cstdint>
 #include <mutex>
 
-struct upmem_runtime;
+class upmem_pim_rank;
 
 class CI {
 public:
@@ -22,8 +23,8 @@ public:
   void *mapping_base() const;
   size_t mapping_size() const;
 
-  static void reset_state(upmem_runtime *rt, size_t ci_index);
-  static uint32_t payload_for_command(upmem_runtime *rt, size_t ci,
+  void reset_state();
+  static uint32_t payload_for_command(upmem_pim_rank *rank, size_t ci,
                                       uint64_t cmd_word, bool *needs_mask_fuzz);
 
   std::mutex exec_lock;
@@ -35,7 +36,15 @@ public:
   uint8_t dma_mux_status = 0x00u;
   uint8_t stack_up_mask = 0x00u;
   uint8_t selected_mask = 0x00u;
-  std::array<uint8_t, 8> group_mask{};
+  std::array<uint8_t, kNumGroups> group_mask{};
+  std::array<uint8_t, kNumDpusPerCi> dma_mux_status_per_dpu{};
+  std::array<std::array<uint8_t, 256>, kNumDpusPerCi> dma_ctrl_regs{};
+  uint8_t dma_ctrl_read_register = 0x00u;
+  uint64_t structure = 0;
+  bool iram_write_structure_valid = false;
+  uint16_t iram_write_addr_hi = 0;
+  bool wram_write_structure_valid = false;
+  uint16_t wram_write_addr = 0;
   bool payload_needs_mask_fuzz = false;
   uint8_t payload_fuzz_idx = 0;
 

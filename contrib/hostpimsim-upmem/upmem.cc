@@ -1,6 +1,5 @@
 #include "upmem.hh"
 #include "hostpimsim.h"
-#include "dpu/runtime.hh"
 
 #include <cstdarg>
 #include <cstring>
@@ -79,16 +78,16 @@ static constexpr uint64_t CI_EMPTY_CMD = 0x0000000000000000ULL;
 static constexpr uint64_t CI_BYTE_ORDER_CMD = 0x7777777777777777ULL;
 
 /* ------------------------------------------------------------------------- */
-/* Global simulator state                                                     */
+/* Global simulator rank                                                     */
 /* ------------------------------------------------------------------------- */
 
 static thread_local upmem_pim_rank *g_upmem_tls_state = nullptr;
 
 class upmem_state_scope {
 public:
-  explicit upmem_state_scope(upmem_pim_rank *state) noexcept
+  explicit upmem_state_scope(upmem_pim_rank *rank) noexcept
       : prev_(g_upmem_tls_state) {
-    g_upmem_tls_state = state;
+    g_upmem_tls_state = rank;
   }
 
   ~upmem_state_scope() { g_upmem_tls_state = prev_; }
@@ -98,11 +97,11 @@ private:
 };
 
 static upmem_pim_rank &upmem_state(void) {
-  upmem_pim_rank *state = g_upmem_tls_state;
-  if (!state) {
+  upmem_pim_rank *rank = g_upmem_tls_state;
+  if (!rank) {
     abort();
   }
-  return *state;
+  return *rank;
 }
 
 static bool ensure_pim_device_layer_locked(upmem_pim_rank *rank);
@@ -209,6 +208,10 @@ const upmem_pim_chip &upmem_pim_rank::chip(size_t chip_index) const {
 void upmem_pim_rank::bind_dpu_mram(size_t dpu_global_index, uint8_t *mram_base,
                                    size_t mram_size_bytes) {
   dpu_by_global(dpu_global_index).bind_mram_region(mram_base, mram_size_bytes);
+  if (mram_base && mram_size_bytes > 0) {
+    fallback_mram_base = mram_base;
+    fallback_mram_size = mram_size_bytes;
+  }
 }
 
 CI &upmem_pim_rank::ci_write_lane(size_t ci_index) {
@@ -322,11 +325,6 @@ static void release_upmem_state_on_last_close(upmem_pim_rank *rank) {
 
   StateLockGuard lock_guard(rank->lock);
 
-  if (rank->runtime) {
-    upmem_runtime_destroy(rank->runtime);
-    rank->runtime = nullptr;
-  }
-
   if (rank->dev) {
     upmem_clear_device_user_data(rank->dev);
     (void)pim_device_deinit(rank->dev);
@@ -374,88 +372,60 @@ static void release_upmem_state_on_last_close(upmem_pim_rank *rank) {
       rank->bind_dpu_mram(dpu, nullptr, 0);
     }
   }
+
+  rank->fallback_mram_base = nullptr;
+  rank->fallback_mram_size = 0;
 }
 
-void upmem_destroy_rank(upmem_pim_rank *state) {
-  if (!state) {
+void upmem_destroy_rank(upmem_pim_rank *rank) {
+  if (!rank) {
     return;
   }
 
-  release_upmem_state_on_last_close(state);
-  delete state;
+  release_upmem_state_on_last_close(rank);
+  delete rank;
 }
 
 /* ------------------------------------------------------------------------- */
 /* Minimal rank simulation (ioctl ABI)                                        */
 /* ------------------------------------------------------------------------- */
 
-static int ensure_runtime_locked(void) {
-  upmem_pim_rank &state = upmem_state();
-  if (state.runtime) {
-    return 0;
-  }
-
-  state.runtime = upmem_runtime_create();
-  if (!state.runtime) {
-    errno = ENOMEM;
-    return -1;
-  }
-
-  for (size_t dpu = 0; dpu < UPMEM_MAX_DPUS_PER_RANK; ++dpu) {
-    if (state.dpu_mram[dpu]) {
-      upmem_runtime_bind_mram(state.runtime, dpu, state.dpu_mram[dpu],
-                              state.mram_size);
-    }
-  }
-
-  return 0;
-}
-
 static int ensure_dpu_mram_locked(size_t dpu_id) {
-  upmem_pim_rank &state = upmem_state();
+  upmem_pim_rank &rank = upmem_state();
   if (dpu_id >= UPMEM_MAX_DPUS_PER_RANK) {
     errno = EINVAL;
     return -1;
   }
 
-  if (state.dpu_mram[dpu_id]) {
-    state.bind_dpu_mram(dpu_id, state.dpu_mram[dpu_id], state.mram_size);
-    if (state.runtime) {
-      upmem_runtime_bind_mram(state.runtime, dpu_id, state.dpu_mram[dpu_id],
-                              state.mram_size);
-    }
+  if (rank.dpu_mram[dpu_id]) {
+    rank.bind_dpu_mram(dpu_id, rank.dpu_mram[dpu_id], rank.mram_size);
     return 0;
   }
 
-  void *buf = mmap(nullptr, state.mram_size, PROT_READ | PROT_WRITE,
+  void *buf = mmap(nullptr, rank.mram_size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (buf == MAP_FAILED) {
     return -1;
   }
-  memset(buf, 0, state.mram_size);
-  state.dpu_mram[dpu_id] = static_cast<uint8_t *>(buf);
-  state.bind_dpu_mram(dpu_id, state.dpu_mram[dpu_id], state.mram_size);
-
-  if (state.runtime) {
-    upmem_runtime_bind_mram(state.runtime, dpu_id, state.dpu_mram[dpu_id],
-                            state.mram_size);
-  }
+  memset(buf, 0, rank.mram_size);
+  rank.dpu_mram[dpu_id] = static_cast<uint8_t *>(buf);
+  rank.bind_dpu_mram(dpu_id, rank.dpu_mram[dpu_id], rank.mram_size);
 
   return 0;
 }
 
 static bool transfer_in_bounds(const struct dpu_transfer_mram_abi *tm) {
-  upmem_pim_rank &state = upmem_state();
+  upmem_pim_rank &rank = upmem_state();
   if (!tm) {
     return false;
   }
 
   const size_t off = static_cast<size_t>(tm->offset_in_mram);
   const size_t size = static_cast<size_t>(tm->size);
-  if (off > state.mram_size) {
+  if (off > rank.mram_size) {
     return false;
   }
-  if (size > (state.mram_size - off)) {
+  if (size > (rank.mram_size - off)) {
     return false;
   }
 
@@ -478,13 +448,13 @@ static uint8_t ci_mask_from_commands(const uint64_t *cmds) {
 
 static uint8_t ci_all_dpus_mask(void) { return 0xFFu; }
 
-static inline uint64_t ci_updated_load(const upmem_pim_rank &state, size_t ci) {
-  return state.ci_write_lane(ci).updated.load(std::memory_order_relaxed);
+static inline uint64_t ci_updated_load(const upmem_pim_rank &rank, size_t ci) {
+  return rank.ci_write_lane(ci).updated.load(std::memory_order_relaxed);
 }
 
-static inline void ci_updated_store(upmem_pim_rank &state, size_t ci,
+static inline void ci_updated_store(upmem_pim_rank &rank, size_t ci,
                                     uint64_t value) {
-  state.ci_write_lane(ci).updated.store(value, std::memory_order_relaxed);
+  rank.ci_write_lane(ci).updated.store(value, std::memory_order_relaxed);
 }
 
 [[maybe_unused]] static uint8_t ci_popcount_u8(uint8_t v) {
@@ -498,10 +468,10 @@ static inline void ci_updated_store(upmem_pim_rank &state, size_t ci,
 }
 
 static void ci_reset_selection_state(void) {
-  upmem_pim_rank &state = upmem_state();
+  upmem_pim_rank &rank = upmem_state();
   const uint8_t all = ci_all_dpus_mask();
   for (size_t ci = 0; ci < UPMEM_NB_CI; ++ci) {
-    CI &lane = state.ci_write_lane(ci);
+    CI &lane = rank.ci_write_lane(ci);
     lane.selected_mask = all;
     lane.group_mask.fill(0u);
     lane.group_mask[0] = all;
@@ -523,18 +493,8 @@ static bool ci_is_run_state_read_cmd(uint64_t cmd_word) {
 
 static uint32_t ci_payload_from_command(size_t ci, uint64_t cmd_word,
                                         bool *needs_mask_fuzz) {
-  upmem_pim_rank &state = upmem_state();
-  if (!state.runtime) {
-    if (ensure_runtime_locked() != 0) {
-      if (needs_mask_fuzz) {
-        *needs_mask_fuzz = false;
-      }
-      return 0;
-    }
-  }
-
-  return upmem_runtime_payload_for_command(state.runtime, ci, cmd_word,
-                                           needs_mask_fuzz);
+  upmem_pim_rank &rank = upmem_state();
+  return CI::payload_for_command(&rank, ci, cmd_word, needs_mask_fuzz);
 }
 
 static uint64_t ci_ready_result(bool expected_color_set, uint32_t payload) {
@@ -554,24 +514,12 @@ static uint64_t ci_nop_style_result(bool expected_color_set, uint32_t payload) {
 }
 
 static bool ci_is_thread_command_locked(uint64_t cmd_word) {
-  upmem_pim_rank &state = upmem_state();
-  if (!state.runtime || !state.runtime->thread_cmd_cache_ready) {
-    return false;
-  }
-
-  for (size_t k = 0; k < state.runtime->thread_cmd_cache.size(); ++k) {
-    for (size_t t = 0; t < kNumTasklets; ++t) {
-      if (state.runtime->thread_cmd_cache[k][t] == cmd_word) {
-        return true;
-      }
-    }
-  }
-  return false;
+  return Pipeline::is_thread_command(cmd_word);
 }
 
 static bool ci_command_executes_per_dpu_locked(size_t ci, uint64_t cmd_word,
                                                bool *needs_mask_fuzz) {
-  upmem_pim_rank &state = upmem_state();
+  upmem_pim_rank &rank = upmem_state();
   if (needs_mask_fuzz) {
     *needs_mask_fuzz = false;
   }
@@ -579,14 +527,7 @@ static bool ci_command_executes_per_dpu_locked(size_t ci, uint64_t cmd_word,
   if (ci >= UPMEM_NB_CI) {
     return false;
   }
-  if (!state.runtime && ensure_runtime_locked() != 0) {
-    return false;
-  }
-  if (!state.runtime) {
-    return false;
-  }
-
-  const auto &ci_state = state.runtime->cis[ci];
+  const CI &ci_state = rank.ci_write_lane(ci);
 
   const uint8_t opcode = static_cast<uint8_t>((cmd_word >> 56) & 0xFFu);
   if (opcode != 0x33u) {
@@ -628,7 +569,7 @@ static void ci_compute_single_dpu_payload(size_t ci, uint8_t dpu_local,
                                           uint32_t *payload_out,
                                           bool *needs_mask_fuzz_out,
                                           uint8_t *selected_mask_out) {
-  upmem_pim_rank &state = upmem_state();
+  upmem_pim_rank &rank = upmem_state();
   if (payload_out) {
     *payload_out = 0u;
   }
@@ -639,11 +580,11 @@ static void ci_compute_single_dpu_payload(size_t ci, uint8_t dpu_local,
     *selected_mask_out = 0u;
   }
 
-  if (!state.runtime || ci >= UPMEM_NB_CI || dpu_local >= UPMEM_NB_DPU_PER_CI) {
+  if (ci >= UPMEM_NB_CI || dpu_local >= UPMEM_NB_DPU_PER_CI) {
     return;
   }
 
-  auto &ci_state = state.runtime->cis[ci];
+  CI &ci_state = rank.ci_write_lane(ci);
   const uint8_t original_mask = ci_state.selected_mask;
   const uint8_t worker_mask =
       static_cast<uint8_t>(original_mask & static_cast<uint8_t>(1u << dpu_local));
@@ -658,8 +599,8 @@ static void ci_compute_single_dpu_payload(size_t ci, uint8_t dpu_local,
   ci_state.selected_mask = worker_mask;
 
   bool worker_needs_mask_fuzz = false;
-  const uint32_t payload_part = upmem_runtime_payload_for_command(
-      state.runtime, ci, cmd_word, &worker_needs_mask_fuzz);
+  const uint32_t payload_part =
+      CI::payload_for_command(&rank, ci, cmd_word, &worker_needs_mask_fuzz);
 
   ci_state.selected_mask = original_mask;
 
@@ -675,37 +616,37 @@ static void ci_compute_single_dpu_payload(size_t ci, uint8_t dpu_local,
 }
 
 static void ci_signal_commit_progress_locked(void) {
-  upmem_pim_rank &state = upmem_state();
-  if (!state.ci_commit_active) {
+  upmem_pim_rank &rank = upmem_state();
+  if (!rank.ci_commit_active) {
     return;
   }
 
-  if (state.ci_commit_done >= state.ci_commit_pending) {
-    state.ci_commit_cv.notify_all();
+  if (rank.ci_commit_done >= rank.ci_commit_pending) {
+    rank.ci_commit_cv.notify_all();
   }
 }
 
 static void ci_finalize_commit_for_ci_locked(size_t ci) {
-  upmem_pim_rank &state = upmem_state();
+  upmem_pim_rank &rank = upmem_state();
   if (ci >= UPMEM_NB_CI) {
     return;
   }
 
-  CI &write_lane = state.ci_write_lane(ci);
-  CI &read_lane = state.ci_read_lane(ci);
+  CI &write_lane = rank.ci_write_lane(ci);
+  CI &read_lane = rank.ci_read_lane(ci);
   const bool expected_set =
-      (state.ci_commit_expected_color & (uint8_t)(1u << ci)) != 0;
+      (rank.ci_commit_expected_color & (uint8_t)(1u << ci)) != 0;
   const uint32_t payload = write_lane.dpu_payload_accum;
   const bool needs_mask_fuzz = write_lane.dpu_needs_mask_fuzz;
 
-  ci_updated_store(state, ci,
+  ci_updated_store(rank, ci,
                    needs_mask_fuzz ? ci_nop_style_result(expected_set, payload)
                                    : ci_ready_result(expected_set, payload));
   write_lane.payload_needs_mask_fuzz = needs_mask_fuzz;
   write_lane.payload_fuzz_idx = 0;
 
   if (read_lane.rw_region) {
-    (void)pim_write_raw(read_lane.rw_region, 0, 8, ci_updated_load(state, ci));
+    (void)pim_write_raw(read_lane.rw_region, 0, 8, ci_updated_load(rank, ci));
   }
 
   write_lane.dpu_fanout_active = false;
@@ -714,8 +655,8 @@ static void ci_finalize_commit_for_ci_locked(size_t ci) {
   write_lane.dpu_commit_pending = 0;
   write_lane.dpu_commit_done = 0;
 
-  if (state.ci_commit_active) {
-    state.ci_commit_done++;
+  if (rank.ci_commit_active) {
+    rank.ci_commit_done++;
     ci_signal_commit_progress_locked();
   }
 }
@@ -764,13 +705,13 @@ static void ci_mmio_dpu_handler(pim_device_t *dev, pim_region_t *region,
     return;
   }
 
-  upmem_pim_rank *state_ptr = upmem_state_from_device(dev);
-  if (!state_ptr) {
+  upmem_pim_rank *rank_ptr = upmem_state_from_device(dev);
+  if (!rank_ptr) {
     return;
   }
-  upmem_state_scope scope(state_ptr);
+  upmem_state_scope scope(rank_ptr);
 
-  upmem_pim_rank &state = *state_ptr;
+  upmem_pim_rank &rank = *rank_ptr;
   const size_t ci = static_cast<size_t>(ci_id);
   const uint64_t cmd = value;
   const uint8_t fanout_mask = ci_all_dpus_mask();
@@ -778,11 +719,11 @@ static void ci_mmio_dpu_handler(pim_device_t *dev, pim_region_t *region,
   bool per_dpu_exec = false;
 
   {
-    StateLockGuard lock_guard(state.lock);
-    CI &lane = state.ci_write_lane(ci);
+    StateLockGuard lock_guard(rank.lock);
+    CI &lane = rank.ci_write_lane(ci);
 
     [[maybe_unused]] const bool expected_set =
-        (state.ci_commit_expected_color & (uint8_t)(1u << ci)) != 0;
+        (rank.ci_commit_expected_color & (uint8_t)(1u << ci)) != 0;
 
     lane.dpu_fanout_active = false;
     lane.dpu_exec_per_dpu = false;
@@ -794,16 +735,16 @@ static void ci_mmio_dpu_handler(pim_device_t *dev, pim_region_t *region,
     lane.dpu_cmd = cmd;
 
     if (cmd == CI_EMPTY_CMD) {
-      ci_updated_store(state, ci, CI_EMPTY_CMD);
+      ci_updated_store(rank, ci, CI_EMPTY_CMD);
       lane.payload_needs_mask_fuzz = false;
       lane.payload_fuzz_idx = 0;
     } else if (cmd == CI_BYTE_ORDER_CMD) {
-      ci_updated_store(state, ci, 0x000103FF0F8FCFEFULL);
+      ci_updated_store(rank, ci, 0x000103FF0F8FCFEFULL);
       lane.payload_needs_mask_fuzz = false;
       lane.payload_fuzz_idx = 0;
     } else {
       if (is_ci_software_reset_cmd(cmd)) {
-        state.ci_commit_reset_mask |= (uint8_t)(1u << ci);
+        rank.ci_commit_reset_mask |= (uint8_t)(1u << ci);
       }
 
       bool needs_mask_fuzz = false;
@@ -821,13 +762,13 @@ static void ci_mmio_dpu_handler(pim_device_t *dev, pim_region_t *region,
     }
 
     if (!dispatch_workers) {
-      CI &read_lane = state.ci_read_lane(ci);
+      CI &read_lane = rank.ci_read_lane(ci);
       if (read_lane.rw_region) {
         (void)pim_write_raw(read_lane.rw_region, 0, 8,
-                            ci_updated_load(state, ci));
+                            ci_updated_load(rank, ci));
       }
-      if (state.ci_commit_active) {
-        state.ci_commit_done++;
+      if (rank.ci_commit_active) {
+        rank.ci_commit_done++;
         ci_signal_commit_progress_locked();
       }
     }
@@ -835,7 +776,7 @@ static void ci_mmio_dpu_handler(pim_device_t *dev, pim_region_t *region,
     ci_tracef("  ci%zu cmd=0x%016llx -> upd=0x%016llx fuzz=%d fanout=%d "
               "per_dpu=%d mask=0x%02x",
               ci, (unsigned long long)cmd,
-              (unsigned long long)ci_updated_load(state, ci),
+              (unsigned long long)ci_updated_load(rank, ci),
               lane.payload_needs_mask_fuzz ? 1 : 0, dispatch_workers ? 1 : 0,
               per_dpu_exec ? 1 : 0, dispatch_workers ? (unsigned)fanout_mask : 0u);
   }
@@ -865,19 +806,19 @@ static void ci_dpu_worker_handler(pim_device_t *dev, pim_region_t *region,
     return;
   }
 
-  upmem_pim_rank *state_ptr = upmem_state_from_device(dev);
-  if (!state_ptr) {
+  upmem_pim_rank *rank_ptr = upmem_state_from_device(dev);
+  if (!rank_ptr) {
     return;
   }
-  upmem_state_scope scope(state_ptr);
+  upmem_state_scope scope(rank_ptr);
 
-  upmem_pim_rank &state = *state_ptr;
+  upmem_pim_rank &rank = *rank_ptr;
   const size_t ci = static_cast<size_t>(ci_id);
 
   uint64_t cmd_word = CI_EMPTY_CMD;
   {
-    StateLockGuard lock_guard(state.lock);
-    CI &lane = state.ci_write_lane(ci);
+    StateLockGuard lock_guard(rank.lock);
+    CI &lane = rank.ci_write_lane(ci);
     if (!lane.dpu_fanout_active) {
       return;
     }
@@ -897,15 +838,12 @@ static void ci_dpu_worker_handler(pim_device_t *dev, pim_region_t *region,
         lane.dpu_payload_accum = payload;
         lane.dpu_needs_mask_fuzz = needs_mask_fuzz;
         lane.dpu_serial_exec_done = true;
-        if (state.runtime) {
-          lane.selected_mask = state.runtime->cis[ci].selected_mask;
-        }
       }
 
       ++done;
       lane.dpu_commit_done = done;
-      if (state.ci_commit_active) {
-        state.ci_commit_done++;
+      if (rank.ci_commit_active) {
+        rank.ci_commit_done++;
       }
       if (done == pending) {
         ci_finalize_commit_for_ci_locked(ci);
@@ -919,18 +857,17 @@ static void ci_dpu_worker_handler(pim_device_t *dev, pim_region_t *region,
   uint8_t selected_mask_after = 0;
   bool update_selected_mask = false;
   if (ci_is_run_state_read_cmd(cmd_word)) {
-    payload_part =
-        upmem_runtime_run_state_for_dpu(state.runtime, ci, dpu_local_id);
+    payload_part = Pipeline::run_state_for_dpu(&rank, ci, dpu_local_id);
   } else {
-    std::lock_guard<std::mutex> exec_guard(state.ci_write_lane(ci).exec_lock);
+    std::lock_guard<std::mutex> exec_guard(rank.ci_write_lane(ci).exec_lock);
     ci_compute_single_dpu_payload(ci, dpu_local_id, cmd_word, &payload_part,
                                   &needs_mask_fuzz, &selected_mask_after);
     update_selected_mask = true;
   }
 
   {
-    StateLockGuard lock_guard(state.lock);
-    CI &lane = state.ci_write_lane(ci);
+    StateLockGuard lock_guard(rank.lock);
+    CI &lane = rank.ci_write_lane(ci);
     if (!lane.dpu_fanout_active) {
       return;
     }
@@ -949,8 +886,8 @@ static void ci_dpu_worker_handler(pim_device_t *dev, pim_region_t *region,
 
     ++done;
     lane.dpu_commit_done = done;
-    if (state.ci_commit_active) {
-      state.ci_commit_done++;
+    if (rank.ci_commit_active) {
+      rank.ci_commit_done++;
     }
     if (done == pending) {
       ci_finalize_commit_for_ci_locked(ci);
@@ -1274,26 +1211,18 @@ long upmem_ioctl_slice_info(upmem_pim_rank *rank, unsigned long arg) {
     for (size_t group = 1; group < upmem_pim_rank::kNumGroups; ++group) {
       lane.group_mask[group] &= enabled_mask;
     }
-
-    if (rank->runtime) {
-      auto &ci_state = rank->runtime->cis[ci];
-      ci_state.selected_mask = enabled_mask;
-      ci_state.group_masks[0] = enabled_mask;
-      for (size_t group = 1; group < ci_state.group_masks.size(); ++group) {
-        ci_state.group_masks[group] &= enabled_mask;
-      }
-    }
   }
 
   return 0;
 }
 
 static void setup_mem(void) {
-  upmem_pim_rank &state = upmem_state();
+  upmem_pim_rank &rank = upmem_state();
+  Pipeline::reset_rank(&rank);
   for (size_t ci = 0; ci < UPMEM_NB_CI; ++ci) {
-    CI &lane = state.ci_write_lane(ci);
+    CI &lane = rank.ci_write_lane(ci);
     lane.committed = CI_EMPTY_CMD;
-    ci_updated_store(state, ci, CI_EMPTY_CMD);
+    ci_updated_store(rank, ci, CI_EMPTY_CMD);
     lane.payload_needs_mask_fuzz = false;
     lane.payload_fuzz_idx = 0;
     lane.pc_mode = 0x04u;        /* DPU_PC_MODE_16 */
@@ -1308,21 +1237,11 @@ static void setup_mem(void) {
     lane.dpu_exec_per_dpu = false;
     lane.dpu_serial_exec_done = false;
   }
-  state.ci_sim_color = 0;
-  state.ci_last_expected_color = 0;
-  state.ci_last_mask = 0;
-  state.ci_update_generation = 0;
+  rank.ci_sim_color = 0;
+  rank.ci_last_expected_color = 0;
+  rank.ci_last_mask = 0;
+  rank.ci_update_generation = 0;
   ci_reset_selection_state();
-
-  if (state.runtime) {
-    upmem_runtime_reset(state.runtime);
-    for (size_t dpu = 0; dpu < UPMEM_MAX_DPUS_PER_RANK; ++dpu) {
-      if (state.dpu_mram[dpu]) {
-        upmem_runtime_bind_mram(state.runtime, dpu, state.dpu_mram[dpu],
-                                state.mram_size);
-      }
-    }
-  }
 }
 
 static size_t upmem_page_size(void) {
@@ -1331,11 +1250,11 @@ static size_t upmem_page_size(void) {
 }
 
 static bool map_real_range(void *base, size_t offset, size_t length) {
-  upmem_pim_rank &state = upmem_state();
+  upmem_pim_rank &rank = upmem_state();
   if (!base || base == MAP_FAILED || length == 0) {
     return false;
   }
-  if (offset > state.dax_size || length > (state.dax_size - offset)) {
+  if (offset > rank.dax_size || length > (rank.dax_size - offset)) {
     return false;
   }
 
@@ -1357,7 +1276,7 @@ static bool map_real_range(void *base, size_t offset, size_t length) {
 }
 
 static bool map_real_rank_aperture(void *base) {
-  upmem_pim_rank &state = upmem_state();
+  upmem_pim_rank &rank = upmem_state();
   /* CI windows (same offsets used by xeon_sp backend helpers). */
   if (!map_real_range(base, 0x20000u, 0x1000u)) {
     return false;
@@ -1378,7 +1297,7 @@ static bool map_real_rank_aperture(void *base) {
   constexpr size_t kLogicalBytesPerChunk = 0x10000u; /* 64KB */
 
   const size_t chunk_count =
-      (state.mram_size + kLogicalBytesPerChunk - 1u) / kLogicalBytesPerChunk;
+      (rank.mram_size + kLogicalBytesPerChunk - 1u) / kLogicalBytesPerChunk;
 
   for (size_t chunk = 0; chunk < chunk_count; ++chunk) {
     const size_t chunk_base = chunk * kChunkStride;
@@ -1394,8 +1313,8 @@ static bool map_real_rank_aperture(void *base) {
 }
 
 static bool create_ram_regions_for_range(size_t off, size_t len) {
-  upmem_pim_rank &state = upmem_state();
-  if (!state.dev || len == 0) {
+  upmem_pim_rank &rank = upmem_state();
+  if (!rank.dev || len == 0) {
     return false;
   }
 
@@ -1425,7 +1344,7 @@ static bool create_ram_regions_for_range(size_t off, size_t len) {
 
     if (cursor < hole.begin) {
       const size_t seg_len = hole.begin - cursor;
-      if (!pim_region_create(state.dev, cursor, seg_len, PIM_REGION_RAM)) {
+      if (!pim_region_create(rank.dev, cursor, seg_len, PIM_REGION_RAM)) {
         return false;
       }
     }
@@ -1436,7 +1355,7 @@ static bool create_ram_regions_for_range(size_t off, size_t len) {
   }
 
   if (cursor < range_end) {
-    if (!pim_region_create(state.dev, cursor, range_end - cursor,
+    if (!pim_region_create(rank.dev, cursor, range_end - cursor,
                            PIM_REGION_RAM)) {
       return false;
     }
@@ -1446,8 +1365,8 @@ static bool create_ram_regions_for_range(size_t off, size_t len) {
 }
 
 static bool create_pim_regions_locked(void) {
-  upmem_pim_rank &state = upmem_state();
-  if (!state.dev) {
+  upmem_pim_rank &rank = upmem_state();
+  if (!rank.dev) {
     return false;
   }
 
@@ -1455,10 +1374,10 @@ static bool create_pim_regions_locked(void) {
   constexpr size_t kCiReadBase = 0x28000u;
   constexpr size_t kCiWordSize = sizeof(uint64_t);
 
-  state.dax_region = nullptr;
+  rank.dax_region = nullptr;
   for (size_t ci = 0; ci < UPMEM_NB_CI; ++ci) {
-    CI &write_lane = state.ci_write_lane(ci);
-    CI &read_lane = state.ci_read_lane(ci);
+    CI &write_lane = rank.ci_write_lane(ci);
+    CI &read_lane = rank.ci_read_lane(ci);
     write_lane.mmio_region = nullptr;
     write_lane.rw_region = nullptr;
     read_lane.mmio_region = nullptr;
@@ -1469,13 +1388,13 @@ static bool create_pim_regions_locked(void) {
   for (size_t ci = 0; ci < UPMEM_NB_CI; ++ci) {
     const size_t off = kCiWriteBase + ci * kCiWordSize;
     pim_region_t *r =
-        pim_region_create(state.dev, off, kCiWordSize, PIM_REGION_CTRL_MMIO);
+        pim_region_create(rank.dev, off, kCiWordSize, PIM_REGION_CTRL_MMIO);
     if (!r) {
       return false;
     }
-    state.ci_write_lane(ci).mmio_region = r;
-    if (!state.dax_region) {
-      state.dax_region = r;
+    rank.ci_write_lane(ci).mmio_region = r;
+    if (!rank.dax_region) {
+      rank.dax_region = r;
     }
   }
 
@@ -1483,11 +1402,11 @@ static bool create_pim_regions_locked(void) {
   for (size_t ci = 0; ci < UPMEM_NB_CI; ++ci) {
     const size_t off = kCiReadBase + ci * kCiWordSize;
     pim_region_t *r =
-        pim_region_create(state.dev, off, kCiWordSize, PIM_REGION_CTRL_RW);
+        pim_region_create(rank.dev, off, kCiWordSize, PIM_REGION_CTRL_RW);
     if (!r) {
       return false;
     }
-    state.ci_read_lane(ci).rw_region = r;
+    rank.ci_read_lane(ci).rw_region = r;
   }
 
   /* RAM regions for each contiguous MRAM-mapped range in the aperture. */
@@ -1497,7 +1416,7 @@ static bool create_pim_regions_locked(void) {
   constexpr size_t kLogicalBytesPerChunk = 0x10000u; /* 64KB */
 
   const size_t chunk_count =
-      (state.mram_size + kLogicalBytesPerChunk - 1u) / kLogicalBytesPerChunk;
+      (rank.mram_size + kLogicalBytesPerChunk - 1u) / kLogicalBytesPerChunk;
 
   for (size_t chunk = 0; chunk < chunk_count; ++chunk) {
     const size_t chunk_base = chunk * kChunkStride;
@@ -1513,8 +1432,8 @@ static bool create_pim_regions_locked(void) {
 }
 
 static bool register_ci_handlers_locked(void) {
-  upmem_pim_rank &state = upmem_state();
-  if (!state.dev) {
+  upmem_pim_rank &rank = upmem_state();
+  if (!rank.dev) {
     return false;
   }
 
@@ -1522,13 +1441,13 @@ static bool register_ci_handlers_locked(void) {
   constexpr size_t kCiRegSize = sizeof(uint64_t);
 
   for (size_t ci = 0; ci < UPMEM_NB_CI; ++ci) {
-    pim_region_t *region = state.ci_write_lane(ci).mmio_region;
+    pim_region_t *region = rank.ci_write_lane(ci).mmio_region;
     if (!region) {
       return false;
     }
 
     pim_error_t err = pim_register_dpu_handler(
-        state.dev, region, kCiRegOffset, kCiRegSize, 0, ci_mmio_dpu_handler,
+        rank.dev, region, kCiRegOffset, kCiRegSize, 0, ci_mmio_dpu_handler,
         encode_ci_handler_user_data(static_cast<uint8_t>(ci)));
     if (err != PIM_SUCCESS) {
       return false;
@@ -1536,7 +1455,7 @@ static bool register_ci_handlers_locked(void) {
 
     for (size_t dpu_local = 0; dpu_local < UPMEM_NB_DPU_PER_CI; ++dpu_local) {
       err = pim_register_dpu_handler(
-          state.dev, region, kCiRegOffset, kCiRegSize,
+          rank.dev, region, kCiRegOffset, kCiRegSize,
           static_cast<uint32_t>(dpu_local + 1), ci_dpu_worker_handler,
           encode_ci_dpu_handler_user_data(static_cast<uint8_t>(ci),
                                           static_cast<uint8_t>(dpu_local)));
@@ -1554,17 +1473,17 @@ static bool register_ci_handlers_locked(void) {
 /* ------------------------------------------------------------------------- */
 
 static void reset_pim_device_layer_locked(void) {
-  upmem_pim_rank &state = upmem_state();
-  if (state.dev) {
-    upmem_clear_device_user_data(state.dev);
-    (void)pim_device_deinit(state.dev);
-    state.dev = nullptr;
+  upmem_pim_rank &rank = upmem_state();
+  if (rank.dev) {
+    upmem_clear_device_user_data(rank.dev);
+    (void)pim_device_deinit(rank.dev);
+    rank.dev = nullptr;
   }
 
-  state.dax_region = nullptr;
+  rank.dax_region = nullptr;
   for (size_t ci = 0; ci < UPMEM_NB_CI; ++ci) {
-    CI &write_lane = state.ci_write_lane(ci);
-    CI &read_lane = state.ci_read_lane(ci);
+    CI &write_lane = rank.ci_write_lane(ci);
+    CI &read_lane = rank.ci_read_lane(ci);
     write_lane.mmio_region = nullptr;
     write_lane.rw_region = nullptr;
     read_lane.mmio_region = nullptr;
@@ -1579,16 +1498,16 @@ static void reset_pim_device_layer_locked(void) {
     write_lane.dpu_serial_exec_done = false;
   }
 
-  state.ci_commit_active = false;
-  state.ci_commit_cv.notify_all();
-  state.ci_commit_pending = 0;
-  state.ci_commit_done = 0;
-  state.ci_commit_expected_color = 0;
-  state.ci_commit_reset_mask = 0;
+  rank.ci_commit_active = false;
+  rank.ci_commit_cv.notify_all();
+  rank.ci_commit_pending = 0;
+  rank.ci_commit_done = 0;
+  rank.ci_commit_expected_color = 0;
+  rank.ci_commit_reset_mask = 0;
 
-  if (state.dax_backing && state.dax_backing != MAP_FAILED) {
-    (void)munmap(state.dax_backing, state.dax_size);
-    state.dax_backing = nullptr;
+  if (rank.dax_backing && rank.dax_backing != MAP_FAILED) {
+    (void)munmap(rank.dax_backing, rank.dax_size);
+    rank.dax_backing = nullptr;
   }
 }
 

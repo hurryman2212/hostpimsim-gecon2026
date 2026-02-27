@@ -1,6 +1,4 @@
-#include "dpu.hh"
-#include "../ci/ci.hh"
-#include "runtime.hh"
+#include "../upmem.hh"
 
 /* Merged runtime/decode/execute/control/ci pipeline translation unit. */
 
@@ -582,18 +580,16 @@ enum class ThreadCmdKind : uint8_t {
 struct DecodedInst48;
 struct DecodedProgram48CacheEntry;
 std::shared_ptr<const DecodedProgram48CacheEntry>
-get_decoded_program_cache_48(DpuState &dpu);
-void invalidate_decoded_program_cache_48(const DpuState *dpu);
+get_decoded_program_cache_48(upmem_dpu &dpu);
+void invalidate_decoded_program_cache_48(const upmem_dpu *dpu);
 
 bool replay_strict_sig_allowed_48(const std::string &sig);
 bool replay_should_fire_from_sources_48(const DecodedInst48 &ins,
                                         const dpu_regfile &rf);
 void replay_update_sources_48(const DecodedInst48 &ins, dpu_regfile &rf);
 
-bool execute_launch_program_48(DpuState &dpu);
-void execute_launch_program(DpuState &dpu);
-
-/* dpu_index is declared in dpu/runtime.hh */
+bool execute_launch_program_48(upmem_dpu &dpu);
+void execute_launch_program(upmem_dpu &dpu);
 
 static inline uint64_t encode_frame_from_x(uint64_t x, uint8_t tag) {
   uint64_t cmd = 0x3300000000000000ULL;
@@ -760,16 +756,33 @@ static inline bool decode_iram_write_structure(uint64_t cmd,
   return true;
 }
 
-static inline bool decode_thread_command(const upmem_runtime *rt, uint64_t cmd,
+static inline const std::array<std::array<uint64_t, kNumTasklets>, 4> &
+thread_cmd_cache() {
+  static const std::array<std::array<uint64_t, kNumTasklets>, 4> cache = [] {
+    std::array<std::array<uint64_t, kNumTasklets>, 4> local{};
+    constexpr uint64_t kBootBase = 0x7d8320000000ULL;
+    constexpr uint64_t kResumeBase = 0x7d0320000000ULL;
+    constexpr uint64_t kClearBase = 0x7c8320000000ULL;
+    constexpr uint64_t kReadBase = 0x7c0330000000ULL;
+
+    for (uint8_t tid = 0; tid < kNumTasklets; ++tid) {
+      local[0][tid] = thread_frame_command(kBootBase, tid);
+      local[1][tid] = thread_frame_command(kResumeBase, tid);
+      local[2][tid] = thread_frame_command(kClearBase, tid);
+      local[3][tid] = thread_frame_command(kReadBase, tid);
+    }
+    return local;
+  }();
+  return cache;
+}
+
+static inline bool decode_thread_command(uint64_t cmd,
                                          ThreadCmdKind &kind,
                                          uint8_t &thread_id) {
-  if (!rt || !rt->thread_cmd_cache_ready) {
-    return false;
-  }
-
-  for (size_t k = 0; k < rt->thread_cmd_cache.size(); ++k) {
+  const auto &cache = thread_cmd_cache();
+  for (size_t k = 0; k < cache.size(); ++k) {
     for (size_t t = 0; t < kNumTasklets; ++t) {
-      if (rt->thread_cmd_cache[k][t] == cmd) {
+      if (cache[k][t] == cmd) {
         kind = static_cast<ThreadCmdKind>(k);
         thread_id = static_cast<uint8_t>(t);
         return true;
@@ -959,14 +972,7 @@ static inline void exec_tracef(const char *fmt, ...) {
   va_end(ap);
 }
 
-bool wram_word_in_bounds(uint32_t word_addr);
-void write_wram_word(DpuState &dpu, uint32_t word_addr, uint32_t value);
-uint32_t read_wram_word(const DpuState &dpu, uint32_t word_addr);
-
-bool iram_slot_in_bounds(uint16_t iram_slot);
-void write_iram_word(DpuState &dpu, uint16_t iram_slot, uint64_t value48);
-
-static inline void clear_dpu_state(DpuState &dpu) {
+static inline void clear_dpu_state(upmem_dpu &dpu) {
   std::fill(dpu.private_mem.begin(), dpu.private_mem.end(), 0u);
   invalidate_decoded_program_cache_48(&dpu);
 
@@ -1313,20 +1319,6 @@ static inline uint16_t fast_op_from_signature(const std::string &sig) {
   }
   return FAST_OP_NONE;
 }
-
-bool wram_rel_in_bounds(uint32_t addr, size_t size);
-bool wram_load(DpuState &dpu, uint32_t addr, void *dst, size_t size);
-bool wram_store(DpuState &dpu, uint32_t addr, const void *src, size_t size);
-uint8_t wram_load_u8(DpuState &dpu, uint32_t addr);
-uint32_t wram_load_u32(DpuState &dpu, uint32_t addr, bool big_endian);
-uint64_t wram_load_u64(DpuState &dpu, uint32_t addr, bool big_endian);
-void wram_store_u8(DpuState &dpu, uint32_t addr, uint8_t value);
-void wram_store_u16(DpuState &dpu, uint32_t addr, uint16_t value,
-                    bool big_endian);
-void wram_store_u32(DpuState &dpu, uint32_t addr, uint32_t value,
-                    bool big_endian);
-void wram_store_u64(DpuState &dpu, uint32_t addr, uint64_t value,
-                    bool big_endian);
 
 static inline uint8_t dreg_slot(int reg_num) {
   return Pipeline::dreg_slot(reg_num);
@@ -15480,10 +15472,10 @@ static inline bool decode_raw_word_48(uint64_t instruction, RawDecoded48 &out) {
 
 /* ---- merged from decode.cc ---- */
 
-static std::unordered_map<const DpuState *,
+static std::unordered_map<const upmem_dpu *,
                           std::shared_ptr<const DecodedProgram48CacheEntry>> &
 program_cache_48() {
-  static std::unordered_map<const DpuState *,
+  static std::unordered_map<const upmem_dpu *,
                             std::shared_ptr<const DecodedProgram48CacheEntry>>
       cache;
   return cache;
@@ -15494,7 +15486,7 @@ static std::mutex &program_cache_48_mutex() {
   return cache_mutex;
 }
 
-void invalidate_decoded_program_cache_48(const DpuState *dpu) {
+void invalidate_decoded_program_cache_48(const upmem_dpu *dpu) {
   if (!dpu) {
     return;
   }
@@ -16096,7 +16088,7 @@ static inline bool decode_iram_program_48(const uint8_t *iram_bytes,
 }
 
 std::shared_ptr<const DecodedProgram48CacheEntry>
-get_decoded_program_cache_48(DpuState &dpu) {
+get_decoded_program_cache_48(upmem_dpu &dpu) {
   {
     std::lock_guard<std::mutex> lock(program_cache_48_mutex());
     auto &cache = program_cache_48();
@@ -16125,7 +16117,7 @@ get_decoded_program_cache_48(DpuState &dpu) {
 
 /* ---- merged from execute.cc ---- */
 
-static inline bool try_execute_fast_op_48(DpuState &dpu, dpu_state &state,
+static inline bool try_execute_fast_op_48(upmem_dpu &dpu, dpu_state &state,
                                           int t, dpu_regfile &rf,
                                           const DecodedInst48 &ins, uint32_t ra,
                                           uint32_t rb, uint32_t imm_u32,
@@ -16417,7 +16409,7 @@ static inline bool try_execute_fast_op_48(DpuState &dpu, dpu_state &state,
   case FAST_OP_LW_RRI: {
     const uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(ra) +
                                                 static_cast<int32_t>(ins.off));
-    const uint32_t v = wram_load_u32(dpu, addr, ins.endian != 0);
+    const uint32_t v = WRAM::load_u32(dpu, addr, ins.endian != 0);
     rf.write_reg(static_cast<uint8_t>(ins.rc), v);
     rf.ZF = (v == 0);
     return true;
@@ -16425,7 +16417,7 @@ static inline bool try_execute_fast_op_48(DpuState &dpu, dpu_state &state,
   case FAST_OP_LBU_RRI: {
     const uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(ra) +
                                                 static_cast<int32_t>(ins.off));
-    const uint8_t v = wram_load_u8(dpu, addr);
+    const uint8_t v = WRAM::load_u8(dpu, addr);
     rf.write_reg(static_cast<uint8_t>(ins.rc), static_cast<uint32_t>(v));
     rf.ZF = (v == 0);
     return true;
@@ -16433,7 +16425,7 @@ static inline bool try_execute_fast_op_48(DpuState &dpu, dpu_state &state,
   case FAST_OP_LBS_RRI: {
     const uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(ra) +
                                                 static_cast<int32_t>(ins.off));
-    const int8_t v = static_cast<int8_t>(wram_load_u8(dpu, addr));
+    const int8_t v = static_cast<int8_t>(WRAM::load_u8(dpu, addr));
     rf.write_reg(static_cast<uint8_t>(ins.rc),
                  static_cast<uint32_t>(static_cast<int32_t>(v)));
     rf.ZF = (v == 0);
@@ -16443,25 +16435,25 @@ static inline bool try_execute_fast_op_48(DpuState &dpu, dpu_state &state,
     const uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(ra) +
                                                 static_cast<int32_t>(ins.off));
     const uint32_t val = static_cast<uint32_t>(ins.imm);
-    wram_store_u32(dpu, addr, val, ins.endian != 0);
+    WRAM::store_u32(dpu, addr, val, ins.endian != 0);
     return true;
   }
   case FAST_OP_SW_RIR: {
     const uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(ra) +
                                                 static_cast<int32_t>(ins.off));
-    wram_store_u32(dpu, addr, rb, ins.endian != 0);
+    WRAM::store_u32(dpu, addr, rb, ins.endian != 0);
     return true;
   }
   case FAST_OP_SB_RIR: {
     const uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(ra) +
                                                 static_cast<int32_t>(ins.off));
-    wram_store_u8(dpu, addr, static_cast<uint8_t>(rb & 0xFFu));
+    WRAM::store_u8(dpu, addr, static_cast<uint8_t>(rb & 0xFFu));
     return true;
   }
   case FAST_OP_LD_RRI: {
     const uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(ra) +
                                                 static_cast<int32_t>(ins.off));
-    const uint64_t v = wram_load_u64(dpu, addr, ins.endian != 0);
+    const uint64_t v = WRAM::load_u64(dpu, addr, ins.endian != 0);
     rf.write_dreg(dreg_slot(ins.dc), v);
     rf.ZF = (v == 0);
     return true;
@@ -16470,7 +16462,7 @@ static inline bool try_execute_fast_op_48(DpuState &dpu, dpu_state &state,
     const uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(ra) +
                                                 static_cast<int32_t>(ins.off));
     const uint64_t v = rf.read_dreg(dreg_slot(ins.db));
-    wram_store_u64(dpu, addr, v, ins.endian != 0);
+    WRAM::store_u64(dpu, addr, v, ins.endian != 0);
     return true;
   }
   case FAST_OP_LDMA_RRI:
@@ -16740,7 +16732,7 @@ static inline bool try_execute_fast_op_48(DpuState &dpu, dpu_state &state,
   return false;
 }
 
-bool execute_launch_program_48(DpuState &dpu) {
+bool execute_launch_program_48(upmem_dpu &dpu) {
   if (!dpu.launch_pending) {
     return true;
   }
@@ -16770,10 +16762,10 @@ bool execute_launch_program_48(DpuState &dpu) {
   exec_tracef("launch48 begin: run_mask=0x%08x insts=%zu mram[0..3]=%02x %02x "
               "%02x %02x",
               dpu.running_tasklets, program.size(),
-              static_cast<unsigned>(dpu.mram_base[0]),
-              static_cast<unsigned>(dpu.mram_base[1]),
-              static_cast<unsigned>(dpu.mram_base[2]),
-              static_cast<unsigned>(dpu.mram_base[3]));
+              static_cast<unsigned>(dpu.mram_base()[0]),
+              static_cast<unsigned>(dpu.mram_base()[1]),
+              static_cast<unsigned>(dpu.mram_base()[2]),
+              static_cast<unsigned>(dpu.mram_base()[3]));
   if (exec_trace_enabled()) {
     const size_t wb = WRAM_OFFSET + 0xF8u;
     if (wb + 8u <= dpu.private_mem.size()) {
@@ -17763,20 +17755,20 @@ bool execute_launch_program_48(DpuState &dpu) {
         } else if (ins.signature == "lbu:rri" || ins.signature == "lbu:erri") {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
-          const uint8_t v = wram_load_u8(dpu, addr);
+          const uint8_t v = WRAM::load_u8(dpu, addr);
           rf.write_reg(static_cast<uint8_t>(ins.rc), static_cast<uint32_t>(v));
           rf.ZF = (v == 0);
         } else if (ins.signature == "lbs:rri" || ins.signature == "lbs:erri") {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
-          const int8_t v = static_cast<int8_t>(wram_load_u8(dpu, addr));
+          const int8_t v = static_cast<int8_t>(WRAM::load_u8(dpu, addr));
           rf.write_reg(static_cast<uint8_t>(ins.rc),
                        static_cast<uint32_t>(static_cast<int32_t>(v)));
           rf.ZF = (v == 0);
         } else if (ins.signature == "lw:rri" || ins.signature == "lw:erri") {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
-          const uint32_t v = wram_load_u32(dpu, addr, ins.endian != 0);
+          const uint32_t v = WRAM::load_u32(dpu, addr, ins.endian != 0);
           rf.write_reg(static_cast<uint8_t>(ins.rc), v);
           rf.ZF = (v == 0);
           if (exec_trace_enabled()) {
@@ -17792,14 +17784,14 @@ bool execute_launch_program_48(DpuState &dpu) {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
           const int32_t v =
-              static_cast<int32_t>(wram_load_u32(dpu, addr, ins.endian != 0));
+              static_cast<int32_t>(WRAM::load_u32(dpu, addr, ins.endian != 0));
           rf.write_dreg(dreg_slot(ins.dc),
                         static_cast<uint64_t>(static_cast<int64_t>(v)));
           rf.ZF = (v == 0);
         } else if (ins.signature == "ld:rri" || ins.signature == "ld:erri") {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
-          const uint64_t v = wram_load_u64(dpu, addr, ins.endian != 0);
+          const uint64_t v = WRAM::load_u64(dpu, addr, ins.endian != 0);
           rf.write_dreg(dreg_slot(ins.dc), v);
           rf.ZF = (v == 0);
           if (exec_trace_enabled()) {
@@ -17816,7 +17808,7 @@ bool execute_launch_program_48(DpuState &dpu) {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
           const uint32_t val = static_cast<uint32_t>(ins.imm);
-          wram_store_u32(dpu, addr, val, ins.endian != 0);
+          WRAM::store_u32(dpu, addr, val, ins.endian != 0);
           if (exec_trace_enabled()) {
             static size_t store_trace = 0;
             if (store_trace < 5000 && addr >= WRAM_SIZE) {
@@ -17827,7 +17819,7 @@ bool execute_launch_program_48(DpuState &dpu) {
         } else if (ins.signature == "sw:rir" || ins.signature == "sw:erir") {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
-          wram_store_u32(dpu, addr, rb, ins.endian != 0);
+          WRAM::store_u32(dpu, addr, rb, ins.endian != 0);
           if (exec_trace_enabled()) {
             static size_t store_trace = 0;
             if (store_trace < 5000 && addr >= WRAM_SIZE) {
@@ -17839,28 +17831,28 @@ bool execute_launch_program_48(DpuState &dpu) {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
           const uint8_t val = static_cast<uint8_t>(ins.imm & 0xFF);
-          wram_store_u8(dpu, addr, val);
+          WRAM::store_u8(dpu, addr, val);
         } else if (ins.signature == "sb:rir" || ins.signature == "sb:erir") {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
           const uint8_t val = static_cast<uint8_t>(rb & 0xFFu);
-          wram_store_u8(dpu, addr, val);
+          WRAM::store_u8(dpu, addr, val);
         } else if (ins.signature == "sh:rii" || ins.signature == "sh:erii") {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
           const uint16_t val = static_cast<uint16_t>(imm_u32 & 0xFFFFu);
-          wram_store_u16(dpu, addr, val, ins.endian != 0);
+          WRAM::store_u16(dpu, addr, val, ins.endian != 0);
         } else if (ins.signature == "sh:rir" || ins.signature == "sh:erir") {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
           const uint16_t val = static_cast<uint16_t>(rb & 0xFFFFu);
-          wram_store_u16(dpu, addr, val, ins.endian != 0);
+          WRAM::store_u16(dpu, addr, val, ins.endian != 0);
         } else if (ins.signature == "sd:rii" || ins.signature == "sd:erii") {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
           const uint64_t v =
               static_cast<uint64_t>(static_cast<int64_t>(ins.imm));
-          wram_store_u64(dpu, addr, v, ins.endian != 0);
+          WRAM::store_u64(dpu, addr, v, ins.endian != 0);
           if (exec_trace_enabled()) {
             static size_t store_trace = 0;
             if (store_trace < 5000 && addr >= WRAM_SIZE) {
@@ -17873,7 +17865,7 @@ bool execute_launch_program_48(DpuState &dpu) {
           const uint32_t addr = static_cast<uint32_t>(
               static_cast<int32_t>(ra) + static_cast<int32_t>(ins.off));
           const uint64_t v = rf.read_dreg(dreg_slot(ins.db));
-          wram_store_u64(dpu, addr, v, ins.endian != 0);
+          WRAM::store_u64(dpu, addr, v, ins.endian != 0);
           if (exec_trace_enabled()) {
             static size_t store_trace = 0;
             if (store_trace < 5000 && addr >= WRAM_SIZE) {
@@ -17894,13 +17886,13 @@ bool execute_launch_program_48(DpuState &dpu) {
               << 3;
 
           size_t copy_bytes = static_cast<size_t>(n);
-          if (w >= WRAM_SIZE || m >= dpu.mram_size || !dpu.mram_base) {
+          if (w >= WRAM_SIZE || m >= dpu.mram_size() || !dpu.mram_base()) {
             copy_bytes = 0;
           } else {
             copy_bytes =
                 std::min(copy_bytes, static_cast<size_t>(WRAM_SIZE - w));
             copy_bytes =
-                std::min(copy_bytes, static_cast<size_t>(dpu.mram_size - m));
+                std::min(copy_bytes, static_cast<size_t>(dpu.mram_size() - m));
           }
 
           const bool load_to_wram = (ins.signature == "ldma:rri");
@@ -17999,13 +17991,13 @@ bool execute_launch_program_48(DpuState &dpu) {
   dpu.launch_pending = false;
 
   /* Keep dpulog reader stable even when runtime printf emulation is partial. */
-  wram_store_u32(dpu, 0x10u, 0u, false);   // __stdout_buffer_state[0]
-  wram_store_u32(dpu, 0x14u, 0u, false);   // __stdout_buffer_state[1]
-  wram_store_u32(dpu, 0x10F0u, 0u, false); // __stdout_cache_write_pointer
-  wram_store_u32(dpu, 0x10F4u, 0u, false); // __stdout_nr_of_writes
+  WRAM::store_u32(dpu, 0x10u, 0u, false);   // __stdout_buffer_state[0]
+  WRAM::store_u32(dpu, 0x14u, 0u, false);   // __stdout_buffer_state[1]
+  WRAM::store_u32(dpu, 0x10F0u, 0u, false); // __stdout_cache_write_pointer
+  WRAM::store_u32(dpu, 0x10F4u, 0u, false); // __stdout_nr_of_writes
 
   uint32_t wram_result =
-      read_wram_word(dpu, static_cast<uint32_t>(0x11D0u >> 2));
+      WRAM::read_word(dpu, static_cast<uint32_t>(0x11D0u >> 2));
   exec_tracef("launch48 end: steps=%zu run_mask=0x%08x wram_result0=0x%08x",
               steps, dpu.running_tasklets, wram_result);
 
@@ -18060,7 +18052,7 @@ bool execute_launch_program_48(DpuState &dpu) {
   return true;
 }
 
-void execute_launch_program(DpuState &dpu) {
+void execute_launch_program(upmem_dpu &dpu) {
   if (execute_launch_program_48(dpu)) {
     return;
   }
@@ -18072,96 +18064,52 @@ void execute_launch_program(DpuState &dpu) {
 
 /* ---- merged from control.cc ---- */
 
-static inline void ensure_thread_cmd_cache(upmem_runtime *rt) {
-  if (!rt || rt->thread_cmd_cache_ready) {
-    return;
-  }
-
-  constexpr uint64_t kBootBase = 0x7d8320000000ULL;
-  constexpr uint64_t kResumeBase = 0x7d0320000000ULL;
-  constexpr uint64_t kClearBase = 0x7c8320000000ULL;
-  constexpr uint64_t kReadBase = 0x7c0330000000ULL;
-
-  for (uint8_t tid = 0; tid < kNumTasklets; ++tid) {
-    rt->thread_cmd_cache[0][tid] = thread_frame_command(kBootBase, tid);
-    rt->thread_cmd_cache[1][tid] = thread_frame_command(kResumeBase, tid);
-    rt->thread_cmd_cache[2][tid] = thread_frame_command(kClearBase, tid);
-    rt->thread_cmd_cache[3][tid] = thread_frame_command(kReadBase, tid);
-  }
-
-  rt->thread_cmd_cache_ready = true;
+void Pipeline::reset_ci(CI &ci) {
+  ci.reset_state();
 }
 
-/* MRAM::bind implementation is split into mram.cc. */
-
-struct upmem_runtime *upmem_runtime_create(void) {
-  auto *rt = new upmem_runtime();
-  ensure_thread_cmd_cache(rt);
-  upmem_runtime_reset(rt);
-  return rt;
-}
-
-void upmem_runtime_destroy(struct upmem_runtime *rt) { delete rt; }
-
-void upmem_runtime_reset(struct upmem_runtime *rt) {
-  if (!rt) {
+void Pipeline::reset_rank(upmem_pim_rank *rank) {
+  if (!rank) {
     return;
   }
 
   for (size_t ci = 0; ci < kNumCis; ++ci) {
-    CI::reset_state(rt, ci);
+    reset_ci(rank->ci_write_lane(ci));
   }
 
-  for (auto &dpu : rt->dpus) {
-    clear_dpu_state(dpu);
+  for (size_t dpu = 0; dpu < kNumDpus; ++dpu) {
+    clear_dpu_state(rank->dpu_by_global(dpu));
   }
 }
 
-void upmem_runtime_bind_mram(struct upmem_runtime *rt, size_t dpu_global_index,
-                             void *mram_base, size_t mram_size) {
-  MRAM::bind(rt, dpu_global_index, mram_base, mram_size);
-}
-
-/* ---- merged from ci.cc ---- */
-
-void Pipeline::reset_ci(CiState &ci) {
-  ci.selected_mask = 0xFFu;
-  ci.group_masks.fill(0u);
-  ci.group_masks[0] = 0x01u;
-
-  ci.pc_mode = 0x04u;
-  ci.dma_mux_status.fill(0x00u);
-  for (auto &regs : ci.dma_ctrl_regs) {
-    regs.fill(0x00u);
+bool Pipeline::is_thread_command(uint64_t cmd_word) {
+  const auto &cache = thread_cmd_cache();
+  for (const auto &kind_cache : cache) {
+    for (const auto value : kind_cache) {
+      if (value == cmd_word) {
+        return true;
+      }
+    }
   }
-  ci.dma_ctrl_read_register = 0x00u;
-  ci.stack_up_mask = 0x00u;
-
-  ci.structure = 0;
-  ci.iram_write_structure_valid = false;
-  ci.iram_write_addr_hi = 0;
-  ci.wram_write_structure_valid = false;
-  ci.wram_write_addr = 0;
+  return false;
 }
 
-static inline void mark_launch_complete(DpuState &dpu) {
+static inline void mark_launch_complete(upmem_dpu &dpu) {
   execute_launch_program(dpu);
 }
 
-/* CI reset/payload entry points are exposed through class CI (ci.cc). */
-
-uint32_t Pipeline::payload_for_command(struct upmem_runtime *rt, size_t ci,
+uint32_t Pipeline::payload_for_command(upmem_pim_rank *rank, size_t ci,
                                        uint64_t cmd_word,
                                        bool *needs_mask_fuzz) {
   if (needs_mask_fuzz) {
     *needs_mask_fuzz = false;
   }
 
-  if (!rt || ci >= kNumCis) {
+  if (!rank || ci >= kNumCis) {
     return 0u;
   }
 
-  auto &ci_state = rt->cis[ci];
+  CI &ci_state = rank->ci_write_lane(ci);
 
   if (cmd_word == kCiIdentity) {
     return 0x00000001u;
@@ -18170,7 +18118,7 @@ uint32_t Pipeline::payload_for_command(struct upmem_runtime *rt, size_t ci,
   if ((cmd_word & 0xFFFF00000000FF00ULL) == 0x01FF00000000FF00ULL) {
     Pipeline::reset_ci(ci_state);
     for (uint8_t dpu = 0; dpu < kNumDpusPerCi; ++dpu) {
-      clear_dpu_state(rt->dpus[dpu_index(ci, dpu)]);
+      clear_dpu_state(rank->dpu_by_global(dpu_index(ci, dpu)));
     }
     return 0x00000000u;
   }
@@ -18230,8 +18178,8 @@ uint32_t Pipeline::payload_for_command(struct upmem_runtime *rt, size_t ci,
       if ((ci_state.selected_mask & dpu_bit) == 0) {
         continue;
       }
-      auto &state = rt->dpus[dpu_index(ci, dpu)];
-      write_iram_word(state, addr, data);
+      auto &state = rank->dpu_by_global(dpu_index(ci, dpu));
+      IRAM::write_word(state, addr, data);
     }
 
     return ci_state.selected_mask;
@@ -18268,8 +18216,8 @@ uint32_t Pipeline::payload_for_command(struct upmem_runtime *rt, size_t ci,
       if ((ci_state.selected_mask & dpu_bit) == 0) {
         continue;
       }
-      auto &state = rt->dpus[dpu_index(ci, dpu)];
-      write_wram_word(state, addr, data);
+      auto &state = rank->dpu_by_global(dpu_index(ci, dpu));
+      WRAM::write_word(state, addr, data);
     }
 
     return ci_state.selected_mask;
@@ -18288,12 +18236,12 @@ uint32_t Pipeline::payload_for_command(struct upmem_runtime *rt, size_t ci,
     }
     if (b0 == 0x09u) {
       const uint8_t group_id = static_cast<uint8_t>(b1 & 0x7u);
-      ci_state.selected_mask = ci_state.group_masks[group_id];
+      ci_state.selected_mask = ci_state.group_mask[group_id];
       return ci_state.selected_mask;
     }
     if (b0 == 0x0Cu) {
       const uint8_t group_id = static_cast<uint8_t>(b1 & 0x7u);
-      ci_state.group_masks[group_id] = ci_state.selected_mask;
+      ci_state.group_mask[group_id] = ci_state.selected_mask;
       return ci_state.selected_mask;
     }
 
@@ -18307,7 +18255,8 @@ uint32_t Pipeline::payload_for_command(struct upmem_runtime *rt, size_t ci,
       }
 
       if (ci_state.dma_ctrl_read_register == 0x02u) {
-        return ci_state.dma_mux_status[selected];
+        ci_state.dma_mux_status = ci_state.dma_mux_status_per_dpu[selected];
+        return ci_state.dma_mux_status;
       }
 
       return ci_state.dma_ctrl_regs[selected][ci_state.dma_ctrl_read_register];
@@ -18315,11 +18264,11 @@ uint32_t Pipeline::payload_for_command(struct upmem_runtime *rt, size_t ci,
     if (b0 == 0x84u && b1 == 0x02u) {
       uint8_t run_mask = 0;
       for (uint8_t dpu = 0; dpu < kNumDpusPerCi; ++dpu) {
-        auto &state = rt->dpus[dpu_index(ci, dpu)];
+        auto &state = rank->dpu_by_global(dpu_index(ci, dpu));
         if (state.launch_pending) {
-          if (!state.mram_base && rt->fallback_mram_base) {
-            state.mram_base = rt->fallback_mram_base;
-            state.mram_size = rt->fallback_mram_size;
+          if (!state.mram_base() && rank->fallback_mram_base) {
+            state.bind_mram_region(rank->fallback_mram_base,
+                                   rank->fallback_mram_size);
           }
           mark_launch_complete(state);
         }
@@ -18381,8 +18330,12 @@ uint32_t Pipeline::payload_for_command(struct upmem_runtime *rt, size_t ci,
         ci_state.dma_ctrl_regs[dpu][address] = data;
 
         if (address == 0x80u || address == 0x82u || address == 0x84u) {
-          ci_state.dma_mux_status[dpu] = (data == 0u) ? 0x00u : 0x03u;
+          ci_state.dma_mux_status_per_dpu[dpu] = (data == 0u) ? 0x00u : 0x03u;
         }
+      }
+      const uint8_t selected = first_selected_dpu(ci_state.selected_mask);
+      if (selected < kNumDpusPerCi) {
+        ci_state.dma_mux_status = ci_state.dma_mux_status_per_dpu[selected];
       }
 
       return 0x000000FFu;
@@ -18423,7 +18376,7 @@ uint32_t Pipeline::payload_for_command(struct upmem_runtime *rt, size_t ci,
   /* Thread commands (BOOT / RESUME / CLR / READ_RUN). */
   ThreadCmdKind kind{};
   uint8_t thread_id = 0;
-  if (decode_thread_command(rt, cmd_word, kind, thread_id)) {
+  if (decode_thread_command(cmd_word, kind, thread_id)) {
     const uint32_t thread_bit =
         (thread_id < 32u) ? (1u << static_cast<uint32_t>(thread_id)) : 0u;
     uint8_t payload = 0;
@@ -18434,7 +18387,7 @@ uint32_t Pipeline::payload_for_command(struct upmem_runtime *rt, size_t ci,
         continue;
       }
 
-      auto &state = rt->dpus[dpu_index(ci, dpu)];
+      auto &state = rank->dpu_by_global(dpu_index(ci, dpu));
       if (!MRAM::is_bound(state)) {
         continue;
       }
@@ -18472,8 +18425,8 @@ uint32_t Pipeline::payload_for_command(struct upmem_runtime *rt, size_t ci,
         return 0u;
       }
 
-      const auto &state = rt->dpus[dpu_index(ci, selected)];
-      return read_wram_word(state, word_addr);
+      const auto &state = rank->dpu_by_global(dpu_index(ci, selected));
+      return WRAM::read_word(state, word_addr);
     }
   }
 
@@ -18484,23 +18437,16 @@ uint32_t Pipeline::payload_for_command(struct upmem_runtime *rt, size_t ci,
   return ci_state.selected_mask;
 }
 
-uint32_t upmem_pipeline_payload_for_command(struct upmem_runtime *rt, size_t ci,
-                                            uint64_t cmd_word,
-                                            bool *needs_mask_fuzz) {
-  return Pipeline::payload_for_command(rt, ci, cmd_word, needs_mask_fuzz);
-}
-
-uint32_t upmem_pipeline_run_state_for_dpu(struct upmem_runtime *rt, size_t ci,
-                                          uint8_t dpu_local) {
-  if (!rt || ci >= kNumCis || dpu_local >= kNumDpusPerCi) {
+uint32_t Pipeline::run_state_for_dpu(upmem_pim_rank *rank, size_t ci,
+                                     uint8_t dpu_local) {
+  if (!rank || ci >= kNumCis || dpu_local >= kNumDpusPerCi) {
     return 0u;
   }
 
-  auto &state = rt->dpus[dpu_index(ci, dpu_local)];
+  auto &state = rank->dpu_by_global(dpu_index(ci, dpu_local));
   if (state.launch_pending) {
-    if (!state.mram_base && rt->fallback_mram_base) {
-      state.mram_base = rt->fallback_mram_base;
-      state.mram_size = rt->fallback_mram_size;
+    if (!state.mram_base() && rank->fallback_mram_base) {
+      state.bind_mram_region(rank->fallback_mram_base, rank->fallback_mram_size);
     }
     mark_launch_complete(state);
   }

@@ -13,8 +13,6 @@
 #define DPU_NR_TASKLETS 24
 #endif
 
-struct upmem_runtime;
-
 inline constexpr size_t kUpmemNumCi = 8;
 inline constexpr size_t kUpmemNumDpusPerCi = 8;
 inline constexpr size_t kUpmemNumDpus = kUpmemNumCi * kUpmemNumDpusPerCi;
@@ -24,6 +22,7 @@ public:
   static constexpr size_t kDefaultMramSize = (64u * 1024u * 1024u);
   static constexpr size_t kDefaultIramSize = (48u * 1024u);
   static constexpr size_t kDefaultWramSize = (128u * 1024u);
+  static constexpr size_t kPrivateMemSize = PRIVATE_MEM_SIZE;
 
   upmem_dpu();
 
@@ -41,6 +40,10 @@ public:
   const Pipeline &pipeline() const;
   WRAM &wram();
   const WRAM &wram() const;
+
+  std::array<uint8_t, kPrivateMemSize> private_mem{};
+  uint32_t running_tasklets = 0;
+  bool launch_pending = false;
 
 private:
   DMAEngine dma_engine_;
@@ -106,6 +109,8 @@ public:
 
   size_t mram_size = kMramSize;
   uint8_t *dpu_mram[kUpmemNumDpus]{};
+  uint8_t *fallback_mram_base = nullptr;
+  size_t fallback_mram_size = 0;
 
   uint8_t ci_sim_color = 0;
   uint8_t ci_last_expected_color = 0;
@@ -124,8 +129,6 @@ public:
   uint32_t ci_commit_done = 0;
   uint8_t ci_commit_expected_color = 0;
   uint8_t ci_commit_reset_mask = 0;
-
-  struct upmem_runtime *runtime = nullptr;
 
 private:
   static size_t chip_index_from_dpu_global(size_t dpu_global_index);
