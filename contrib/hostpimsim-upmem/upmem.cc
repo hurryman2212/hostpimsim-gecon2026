@@ -407,7 +407,6 @@ static int ensure_dpu_mram_locked(size_t dpu_id) {
   if (buf == MAP_FAILED) {
     return -1;
   }
-  memset(buf, 0, rank.mram_size);
   rank.dpu_mram[dpu_id] = static_cast<uint8_t *>(buf);
   rank.bind_dpu_mram(dpu_id, rank.dpu_mram[dpu_id], rank.mram_size);
 
@@ -661,14 +660,21 @@ static void ci_finalize_commit_for_ci_locked(size_t ci) {
   }
 }
 
-static bool ci_trace_enabled(void) {
-  const char *v = getenv("HOSTPIMSIM_UPMEM_TRACE_CI");
+static bool env_flag_enabled_once(const char *name) {
+  const char *v = getenv(name);
   return v && strcmp(v, "0") != 0;
 }
 
+static bool ci_trace_enabled(void) {
+  static const bool enabled =
+      env_flag_enabled_once("HOSTPIMSIM_UPMEM_TRACE_CI");
+  return enabled;
+}
+
 static bool xfer_trace_enabled(void) {
-  const char *v = getenv("HOSTPIMSIM_UPMEM_TRACE_XFER");
-  return v && strcmp(v, "0") != 0;
+  static const bool enabled =
+      env_flag_enabled_once("HOSTPIMSIM_UPMEM_TRACE_XFER");
+  return enabled;
 }
 
 static void xfer_tracef(const char *fmt, ...) {
@@ -773,12 +779,15 @@ static void ci_mmio_dpu_handler(pim_device_t *dev, pim_region_t *region,
       }
     }
 
-    ci_tracef("  ci%zu cmd=0x%016llx -> upd=0x%016llx fuzz=%d fanout=%d "
-              "per_dpu=%d mask=0x%02x",
-              ci, (unsigned long long)cmd,
-              (unsigned long long)ci_updated_load(rank, ci),
-              lane.payload_needs_mask_fuzz ? 1 : 0, dispatch_workers ? 1 : 0,
-              per_dpu_exec ? 1 : 0, dispatch_workers ? (unsigned)fanout_mask : 0u);
+    if (ci_trace_enabled()) {
+      ci_tracef("  ci%zu cmd=0x%016llx -> upd=0x%016llx fuzz=%d fanout=%d "
+                "per_dpu=%d mask=0x%02x",
+                ci, (unsigned long long)cmd,
+                (unsigned long long)ci_updated_load(rank, ci),
+                lane.payload_needs_mask_fuzz ? 1 : 0, dispatch_workers ? 1 : 0,
+                per_dpu_exec ? 1 : 0,
+                dispatch_workers ? (unsigned)fanout_mask : 0u);
+    }
   }
 
   if (!dispatch_workers) {
@@ -914,13 +923,15 @@ long upmem_ioctl_write_to_rank(upmem_pim_rank *rank, unsigned long arg) {
     return 0;
   }
 
-  size_t ptr_count = 0;
-  for (size_t i = 0; i < UPMEM_MAX_DPUS_PER_RANK; ++i) {
-    if (tm.ptr[i]) {
-      ++ptr_count;
+  if (xfer_trace_enabled()) {
+    size_t ptr_count = 0;
+    for (size_t i = 0; i < UPMEM_MAX_DPUS_PER_RANK; ++i) {
+      if (tm.ptr[i]) {
+        ++ptr_count;
+      }
     }
+    xfer_tracef("write: off=0x%zx size=%zu ptrs=%zu", off, size, ptr_count);
   }
-  xfer_tracef("write: off=0x%zx size=%zu ptrs=%zu", off, size, ptr_count);
 
   // Serialized by rank_ioctl_cb()->pim_vdev_lock(vdev).
   for (size_t i = 0; i < UPMEM_MAX_DPUS_PER_RANK; ++i) {
@@ -956,13 +967,15 @@ long upmem_ioctl_read_from_rank(upmem_pim_rank *rank, unsigned long arg) {
     return 0;
   }
 
-  size_t ptr_count = 0;
-  for (size_t i = 0; i < UPMEM_MAX_DPUS_PER_RANK; ++i) {
-    if (tm.ptr[i]) {
-      ++ptr_count;
+  if (xfer_trace_enabled()) {
+    size_t ptr_count = 0;
+    for (size_t i = 0; i < UPMEM_MAX_DPUS_PER_RANK; ++i) {
+      if (tm.ptr[i]) {
+        ++ptr_count;
+      }
     }
+    xfer_tracef("read: off=0x%zx size=%zu ptrs=%zu", off, size, ptr_count);
   }
-  xfer_tracef("read: off=0x%zx size=%zu ptrs=%zu", off, size, ptr_count);
 
   // Serialized by rank_ioctl_cb()->pim_vdev_lock(vdev).
   for (size_t i = 0; i < UPMEM_MAX_DPUS_PER_RANK; ++i) {
@@ -1245,8 +1258,11 @@ static void setup_mem(void) {
 }
 
 static size_t upmem_page_size(void) {
-  const long ps = sysconf(_SC_PAGESIZE);
-  return (ps > 0) ? static_cast<size_t>(ps) : 4096u;
+  static const size_t page_size = [] {
+    const long ps = sysconf(_SC_PAGESIZE);
+    return (ps > 0) ? static_cast<size_t>(ps) : 4096u;
+  }();
+  return page_size;
 }
 
 static bool map_real_range(void *base, size_t offset, size_t length) {
@@ -1271,7 +1287,6 @@ static bool map_real_range(void *base, size_t offset, size_t length) {
     return false;
   }
 
-  memset(static_cast<uint8_t *>(base) + offset, 0, length);
   return true;
 }
 
