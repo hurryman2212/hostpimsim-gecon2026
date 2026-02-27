@@ -1,5 +1,4 @@
-#include "dpu.hh"
-#include "runtime.hh"
+#include "../upmem.hh"
 
 namespace {
 constexpr size_t kIramWriteWordBytes = 6;
@@ -21,7 +20,7 @@ bool IRAM::slot_in_bounds(uint16_t iram_slot) {
   return (byte_off + kIramWriteWordBytes) <= PRIVATE_MEM_SIZE;
 }
 
-void IRAM::write_word(DpuState &dpu, uint16_t iram_slot, uint64_t value48) {
+void IRAM::write_word(upmem_dpu &dpu, uint16_t iram_slot, uint64_t value48) {
   if (!slot_in_bounds(iram_slot)) {
     return;
   }
@@ -37,12 +36,4 @@ void IRAM::write_word(DpuState &dpu, uint16_t iram_slot, uint64_t value48) {
   }
 
   invalidate_decoded_program_cache_48(&dpu);
-}
-
-bool iram_slot_in_bounds(uint16_t iram_slot) {
-  return IRAM::slot_in_bounds(iram_slot);
-}
-
-void write_iram_word(DpuState &dpu, uint16_t iram_slot, uint64_t value48) {
-  IRAM::write_word(dpu, iram_slot, value48);
 }
