@@ -122,6 +122,11 @@ static void ci_compute_single_dpu_payload(size_t ci, uint8_t dpu_local,
                                           uint8_t *selected_mask_out);
 static void ci_signal_commit_progress_locked(void);
 static void ci_finalize_commit_for_ci_locked(size_t ci);
+static size_t upmem_page_size(void);
+static bool env_flag_enabled_once(const char *name);
+static bool env_flag_enabled_with_default_once(const char *name,
+                                               bool default_enabled);
+static bool eager_zero_alloc_enabled(void);
 
 upmem_dpu::upmem_dpu()
     : dma_engine_(), iram_(kDefaultIramSize),
@@ -407,6 +412,9 @@ static int ensure_dpu_mram_locked(size_t dpu_id) {
   if (buf == MAP_FAILED) {
     return -1;
   }
+  if (eager_zero_alloc_enabled()) {
+    memset(buf, 0, rank.mram_size);
+  }
   rank.dpu_mram[dpu_id] = static_cast<uint8_t *>(buf);
   rank.bind_dpu_mram(dpu_id, rank.dpu_mram[dpu_id], rank.mram_size);
 
@@ -663,6 +671,21 @@ static void ci_finalize_commit_for_ci_locked(size_t ci) {
 static bool env_flag_enabled_once(const char *name) {
   const char *v = getenv(name);
   return v && strcmp(v, "0") != 0;
+}
+
+static bool env_flag_enabled_with_default_once(const char *name,
+                                               bool default_enabled) {
+  const char *v = getenv(name);
+  if (!v || v[0] == '\0') {
+    return default_enabled;
+  }
+  return strcmp(v, "0") != 0;
+}
+
+static bool eager_zero_alloc_enabled(void) {
+  static const bool enabled = env_flag_enabled_with_default_once(
+      "HOSTPIMSIM_UPMEM_EAGER_ZERO_ALLOC", false);
+  return enabled;
 }
 
 static bool ci_trace_enabled(void) {
@@ -1285,6 +1308,10 @@ static bool map_real_range(void *base, size_t offset, size_t length) {
                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
   if (mapped == MAP_FAILED) {
     return false;
+  }
+
+  if (eager_zero_alloc_enabled()) {
+    memset(static_cast<uint8_t *>(base) + offset, 0, length);
   }
 
   return true;
